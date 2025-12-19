@@ -1,0 +1,26 @@
+{
+  "name": "automatic-drive-uploader",
+  "version": "1.0.0",
+  "description": "Trello verilerini Google Drive'a otomatik olarak yedekleyen Express API",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.13.2",
+    "bottleneck": "^2.19.5",
+    "cookie-parser": "^1.4.7",
+    "dotenv": "^17.2.3",
+    "express": "^4.19.2",
+    "googleapis": "^164.1.0",
+    "json2csv": "^6.0.0-alpha.2",
+    "open": "^10.2.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  }
+}

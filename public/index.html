@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Trello Backup Dashboard</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <style>
+      :root {
+        --bg: #f6f7fb;
+        --card: #ffffff;
+        --accent: #007bff;
+        --accent-dark: #0056b3;
+        --success: #28a745;
+        --error: #dc3545;
+        --text: #333;
+        --radius: 14px;
+        --shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+      }
+
+      body {
+        margin: 0;
+        height: 100vh;
+        background: var(--bg);
+        font-family: "Segoe UI", sans-serif;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+      }
+
+      .container {
+        width: 100%;
+        max-width: 430px;
+        background: var(--card);
+        box-shadow: var(--shadow);
+        border-radius: var(--radius);
+        padding: 40px;
+        text-align: center;
+        animation: fadeIn 0.4s ease-in-out;
+      }
+
+      h2 {
+        margin-top: 0;
+        font-size: 1.7rem;
+      }
+
+      input {
+        width: 100%;
+        padding: 10px 12px;
+        border-radius: 8px;
+        border: 1px solid #ccc;
+        font-size: 1rem;
+        margin-top: 10px;
+        transition: 0.2s;
+      }
+
+      input:focus {
+        border-color: var(--accent);
+        outline: none;
+      }
+
+      button {
+        width: 100%;
+        margin-top: 14px;
+        padding: 10px;
+        border: none;
+        border-radius: 8px;
+        background: var(--accent);
+        color: #fff;
+        font-size: 1rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: background 0.25s, transform 0.1s;
+      }
+
+      button:hover {
+        background: var(--accent-dark);
+      }
+
+      button:active {
+        transform: scale(0.98);
+      }
+
+      .link-btn {
+        background: none;
+        color: var(--accent);
+        font-weight: 500;
+        border: none;
+        text-decoration: underline;
+        cursor: pointer;
+        width: auto;
+        margin: 0;
+      }
+
+      #status {
+        margin-top: 20px;
+        font-weight: 500;
+      }
+
+      .success {
+        color: var(--success);
+      }
+
+      .error {
+        color: var(--error);
+      }
+
+      .hidden {
+        display: none;
+      }
+
+      .section {
+        margin-top: 25px;
+        border-top: 1px solid #e6e6e6;
+        padding-top: 20px;
+      }
+
+      @keyframes fadeIn {
+        from {
+          opacity: 0;
+          transform: translateY(15px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+    </style>
+  </head>
+
+  <body>
+    <div class="container">
+      <h2>🔐 Trello Backup Panel</h2>
+
+      <!-- LOGIN -->
+      <div id="login">
+        <input id="password" type="password" placeholder="Enter password" />
+        <button onclick="login()">Sign In</button>
+      </div>
+
+      <!-- MAIN PANEL -->
+      <div id="panel" class="hidden">
+        <div class="section">
+          <h3>💾 Manual Backup</h3>
+          <button onclick="backup()">Start Backup</button>
+          <p id="status"></p>
+        </div>
+
+        <div class="section">
+          <button class="link-btn" onclick="openSettings()">⚙️ Settings</button>
+        </div>
+      </div>
+
+      <!-- SETTINGS PANEL -->
+      <div id="settings" class="hidden">
+        <h3>⚙️ Settings</h3>
+
+        <h4>Google Drive Folder</h4>
+        <input id="folder" placeholder="Enter Folder ID" />
+        <button onclick="confirmFolder()">Save Folder</button>
+
+
+        <div class="section">
+          <button class="link-btn" onclick="backToMain()">⬅️ Back</button>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      async function login() {
+        const password = document.getElementById("password").value.trim();
+        const res = await fetch("/api/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ password }),
+        });
+        if (res.ok) {
+          document.getElementById("login").classList.add("hidden");
+          document.getElementById("panel").classList.remove("hidden");
+        } else {
+          alert("❌ Incorrect password. Please try again.");
+        }
+      }
+
+      async function backup() {
+        const status = document.getElementById("status");
+        status.textContent = "⏳ Backup in progress...";
+        status.className = "";
+
+        try {
+          const res = await fetch("/api/backup", { credentials: "include" });
+          const data = await res.json();
+
+          if (res.ok && data.success) {
+            status.innerHTML = `✅ Backup completed!<br><a href="${data.driveUrl}" target="_blank">View on Google Drive</a>`;
+            status.className = "success";
+          } else {
+            status.textContent = "❌ Backup failed: " + (data.error || "Unknown error");
+            status.className = "error";
+          }
+        } catch (err) {
+          status.textContent = "❌ Request failed: " + err.message;
+          status.className = "error";
+        }
+      }
+
+      function openSettings() {
+        document.getElementById("panel").classList.add("hidden");
+        document.getElementById("settings").classList.remove("hidden");
+      }
+
+      function backToMain() {
+        document.getElementById("settings").classList.add("hidden");
+        document.getElementById("panel").classList.remove("hidden");
+      }
+
+      async function confirmFolder() {
+        const folder = document.getElementById("folder").value.trim();
+        if (!folder) {
+          alert("Please enter a folder ID.");
+          return;
+        }
+        const sure = confirm("Are you sure you want to change the Google Drive folder?");
+        if (!sure) return;
+
+        const res = await fetch("/api/folder", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ folder }),
+        });
+        if (res.ok) {
+          alert("✅ Folder updated successfully!");
+        } else {
+          alert("❌ Failed to update folder.");
+        }
+      }
+
+      async function changePassword() {
+        const oldPass = document.getElementById("oldPass").value.trim();
+        const newPass = document.getElementById("newPass").value.trim();
+        if (!oldPass || !newPass) {
+          alert("Please fill in both fields.");
+          return;
+        }
+
+        const res = await fetch("/api/change-password", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ oldPass, newPass }),
+        });
+
+        if (res.ok) {
+          alert("✅ Password updated successfully!");
+          document.getElementById("oldPass").value = "";
+          document.getElementById("newPass").value = "";
+        } else {
+          alert("❌ Failed to update password.");
+        }
+      }
+    </script>
+  </body>
+</html>
