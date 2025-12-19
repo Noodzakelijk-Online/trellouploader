@@ -1,13 +1,41 @@
 import 'dotenv/config';
 import express from 'express';
+import axios from 'axios';
 import fs from 'fs';
 import path from 'path';
+import Bottleneck from 'bottleneck';
 import { google } from 'googleapis';
+import { Parser } from 'json2csv';
+import cookieParser from 'cookie-parser';
 
 const app = express();
 
+// Middleware’ler
+app.use(express.json());
+app.use(cookieParser());
+app.use(express.static('public'));
+
 /* ============================================================
- *  GOOGLE DRIVE AUTH (DETAYLI DEBUG)
+ *  🔹 0. YARDIMCI: SONSUZ RETRY (429 → 10sn bekle)
+ * ============================================================ */
+async function retryForever(fn, delayMs = 10000) {
+  while (true) {
+    try {
+      return await fn();
+    } catch (err) {
+      const status = err?.response?.status;
+      if (status === 429) {
+        console.warn(`⏳ 429 alındı. ${delayMs / 1000} saniye bekleniyor...`);
+        await new Promise(r => setTimeout(r, delayMs));
+        continue;
+      }
+      throw err; // gerçek hata → yukarı fırlat
+    }
+  }
+}
+
+/* ============================================================
+ *  🔹 1. GOOGLE DRIVE AUTH (ENV TOKEN)
  * ============================================================ */
 async function getDriveAuth() {
   const {
@@ -21,107 +49,235 @@ async function getDriveAuth() {
     throw new Error('GOOGLE_TOKEN_JSON missing');
   }
 
-  let token;
-  try {
-    token = JSON.parse(GOOGLE_TOKEN_JSON);
-  } catch (e) {
-    throw new Error('GOOGLE_TOKEN_JSON is not valid JSON');
-  }
-
-  console.log('🔎 Token keys:', Object.keys(token));
-  console.log('🔎 Has refresh_token:', Boolean(token.refresh_token));
-
   const oAuth2Client = new google.auth.OAuth2(
     GOOGLE_CLIENT_ID,
     GOOGLE_CLIENT_SECRET,
-    GOOGLE_REDIRECT_URI || 'http://localhost'
+    GOOGLE_REDIRECT_URI
   );
 
+  const token = JSON.parse(GOOGLE_TOKEN_JSON);
   oAuth2Client.setCredentials(token);
+
   return oAuth2Client;
 }
 
 /* ============================================================
- *  DRIVE TEST JOB (DETAYLI HATA LOG)
+ *  🔹 2. TRELLO VERİLERİNİ ÇEK (%0 VERİ KAYBI)
  * ============================================================ */
-async function runDriveTest() {
-  const now = new Date().toISOString();
-  const fileName = `drive_test_${Date.now()}.csv`;
-  const filePath = path.join(process.cwd(), fileName);
+function getCardCreationDate(cardId) {
+  const timestamp = parseInt(cardId.substring(0, 8), 16);
+  return new Date(timestamp * 1000).toISOString();
+}
 
-  const csvContent = `status,time
-test,${now}
-`;
+function formatCustomFieldValue(item, boardCustomFieldsById) {
+  const def = boardCustomFieldsById[item.idCustomField];
+  if (!def) return null;
 
-  try {
-    console.log('🟡 DRIVE TEST STARTED');
+  const name = def.name || def.id;
 
-    fs.writeFileSync(filePath, csvContent);
-    console.log('📄 CSV created:', fileName);
+  if (item.value?.text != null) return `${name}=${item.value.text}`;
+  if (item.value?.number != null) return `${name}=${item.value.number}`;
+  if (item.value?.date != null) return `${name}=${item.value.date}`;
+  if (typeof item.value?.checked !== 'undefined') {
+    return `${name}=${item.value.checked ? 'true' : 'false'}`;
+  }
+  if (item.idValue) {
+    const opt = (def.options || []).find(o => o.id === item.idValue);
+    const optText = opt?.value?.text || opt?.value?.label || opt?.id || 'option';
+    return `${name}=${optText}`;
+  }
+  return `${name}=[unknown]`;
+}
 
-    const auth = await getDriveAuth();
-    const drive = google.drive({ version: 'v3', auth });
+function extractArchiveTimestamps(actions) {
+  let archivedAt = '';
+  let unarchivedAt = '';
 
-    console.log('☁️ Uploading to Google Drive...');
-
-    const res = await drive.files.create({
-      requestBody: {
-        name: fileName,
-        mimeType: 'text/csv',
-        parents: [process.env.GOOGLE_FOLDER_ID]
-      },
-      media: {
-        mimeType: 'text/csv',
-        body: fs.createReadStream(filePath)
+  for (const a of actions) {
+    if (a.type === 'updateCard' && a.data?.old && a.data?.card) {
+      if (a.data.old.closed === false && a.data.card.closed === true && !archivedAt) {
+        archivedAt = a.date;
       }
-    });
-
-    fs.unlinkSync(filePath);
-
-    console.log('✅ DRIVE TEST SUCCESS');
-    console.log('🔗 File URL:', `https://drive.google.com/file/d/${res.data.id}`);
-
-  } catch (err) {
-    console.error('❌ DRIVE TEST FAILED');
-
-    console.error('message:', err?.message);
-    console.error('status:', err?.response?.status);
-    console.error('statusText:', err?.response?.statusText);
-
-    console.error(
-      'response.data:',
-      JSON.stringify(err?.response?.data, null, 2)
-    );
-
-    console.error('request.url:', err?.config?.url);
-    console.error('request.method:', err?.config?.method);
-
-    if (err?.response?.headers) {
-      console.error(
-        'response.headers:',
-        JSON.stringify(err.response.headers, null, 2)
-      );
-    }
-
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
+      if (a.data.old.closed === true && a.data.card.closed === false && !unarchivedAt) {
+        unarchivedAt = a.date;
+      }
     }
   }
+  return { archivedAt, unarchivedAt };
+}
+
+async function fetchTrelloData() {
+  const { TRELLO_KEY, TRELLO_TOKEN } = process.env;
+  const base = `https://api.trello.com/1`;
+  const params = `key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`;
+
+  console.log('🔄 Trello verileri çekiliyor...');
+
+  const limiter = new Bottleneck({
+    minTime: 500,
+    maxConcurrent: 1
+  });
+
+  const boardsRes = await retryForever(() =>
+    limiter.schedule(() =>
+      axios.get(`${base}/members/me/boards?filter=all&${params}`)
+    )
+  );
+
+  const boards = boardsRes.data;
+  const allData = [];
+
+  for (const board of boards) {
+    const listsRes = await retryForever(() =>
+      limiter.schedule(() =>
+        axios.get(`${base}/boards/${board.id}/lists?filter=all&${params}`)
+      )
+    );
+    const listsById = new Map(listsRes.data.map(l => [l.id, l]));
+
+    let boardCustomFields = [];
+    try {
+      const cfRes = await retryForever(() =>
+        limiter.schedule(() =>
+          axios.get(`${base}/boards/${board.id}/customFields?${params}`)
+        )
+      );
+      boardCustomFields = cfRes.data || [];
+    } catch {}
+
+    const boardCustomFieldsById = {};
+    for (const def of boardCustomFields) boardCustomFieldsById[def.id] = def;
+
+    const cardsRes = await retryForever(() =>
+      limiter.schedule(() =>
+        axios.get(`${base}/boards/${board.id}/cards?filter=all&${params}`)
+      )
+    );
+
+    for (const card of cardsRes.data) {
+      console.log(`➡️ Kart işleniyor: ${card.name}`);
+
+      const [
+        labelsRes,
+        membersRes,
+        checklistsRes,
+        attachmentsRes,
+        commentsRes,
+        actionsRes,
+        customFieldItemsRes
+      ] = await Promise.all([
+        retryForever(() => limiter.schedule(() => axios.get(`${base}/cards/${card.id}/labels?${params}`))),
+        retryForever(() => limiter.schedule(() => axios.get(`${base}/cards/${card.id}/members?${params}`))),
+        retryForever(() => limiter.schedule(() => axios.get(`${base}/cards/${card.id}/checklists?${params}`))),
+        retryForever(() => limiter.schedule(() => axios.get(`${base}/cards/${card.id}/attachments?${params}`))),
+        retryForever(() => limiter.schedule(() => axios.get(`${base}/cards/${card.id}/actions?filter=commentCard&limit=1000&${params}`))),
+        retryForever(() => limiter.schedule(() => axios.get(`${base}/cards/${card.id}/actions?filter=updateCard,createCard,copyCard,moveCardFromBoard,moveCardToBoard&limit=1000&${params}`))),
+        retryForever(() => limiter.schedule(() => axios.get(`${base}/cards/${card.id}/customFieldItems?${params}`)))
+      ]);
+
+      const list = listsById.get(card.idList);
+      const { archivedAt, unarchivedAt } = extractArchiveTimestamps(actionsRes.data || []);
+
+      allData.push({
+        board_name: board.name,
+        board_url: board.url,
+        board_closed: board.closed ? 'true' : 'false',
+        list_name: list?.name || '',
+        list_url: `https://trello.com/b/${board.shortLink}`,
+        list_closed: list?.closed ? 'true' : 'false',
+        card_name: card.name,
+        card_url: card.shortUrl,
+        card_pos: card.pos,
+        desc: card.desc,
+        created_at: getCardCreationDate(card.id),
+        last_activity: card.dateLastActivity || '',
+        archived_at: archivedAt,
+        unarchived_at: unarchivedAt,
+        due: card.due || '',
+        due_complete: card.dueComplete ? 'true' : 'false',
+        closed: card.closed ? 'true' : 'false',
+        members: membersRes.data.map(m => m.fullName).join(', '),
+        labels: labelsRes.data.map(l => l.name).join(', '),
+        comments: commentsRes.data.map(c => `${c.memberCreator?.fullName}: ${c.data?.text}`).join(' | '),
+        checklists: checklistsRes.data.map(chk =>
+          `${chk.name}: ${chk.checkItems?.map(i => `${i.name} (${i.state})`).join('; ')}`
+        ).join(' | '),
+        attachments: attachmentsRes.data.map(a => a.url).join(', '),
+        custom_fields: customFieldItemsRes.data
+          .map(i => formatCustomFieldValue(i, boardCustomFieldsById))
+          .filter(Boolean)
+          .join(' | ')
+      });
+    }
+  }
+
+  console.log(`✅ TÜM kartlar eksiksiz çekildi: ${allData.length}`);
+  return allData;
 }
 
 /* ============================================================
- *  INTERVAL – HER 10 SANİYEDE BİR TEST
+ *  🔹 3. CSV + DRIVE
  * ============================================================ */
-setInterval(() => {
-  console.log('⏱ Interval tick – running Drive test');
-  runDriveTest();
-}, 10000);
+async function saveToCSVAndUpload(data) {
+  const date = new Date().toISOString().split('T')[0];
+  const filePath = path.join(process.cwd(), `trello_export_${date}.csv`);
+
+  const parser = new Parser();
+  fs.writeFileSync(filePath, parser.parse(data));
+
+  const auth = await getDriveAuth();
+  const drive = google.drive({ version: 'v3', auth });
+
+  const res = await drive.files.create({
+    requestBody: {
+      name: path.basename(filePath),
+      parents: [process.env.GOOGLE_FOLDER_ID]
+    },
+    media: {
+      mimeType: 'text/csv',
+      body: fs.createReadStream(filePath)
+    }
+  });
+
+  fs.unlinkSync(filePath);
+  return `https://drive.google.com/file/d/${res.data.id}`;
+}
 
 /* ============================================================
- *  SERVER (SADECE RENDER İÇİN)
+ *  🔹 4. AUTH + BACKGROUND ENDPOINT
+ * ============================================================ */
+const APP_PASSWORD = process.env.APP_PASSWORD || '1234';
+
+app.post('/api/login', (req, res) => {
+  if (req.body.password === APP_PASSWORD) {
+    res.cookie('auth', 'ok', { httpOnly: true, sameSite: 'lax', secure: true });
+    return res.send('OK');
+  }
+  res.status(401).send('Unauthorized');
+});
+
+function requireAuth(req, res, next) {
+  if (req.cookies?.auth === 'ok') return next();
+  res.status(401).send('Unauthorized');
+}
+
+app.get('/api/backup', requireAuth, (req, res) => {
+  res.json({ success: true, message: 'Backup started in background' });
+
+  setImmediate(async () => {
+    try {
+      console.log('🟡 Backup started (background)');
+      const data = await fetchTrelloData();
+      const url = await saveToCSVAndUpload(data);
+      console.log('✅ Backup finished:', url);
+    } catch (err) {
+      console.error('❌ Backup FAILED (KRİTİK):', err.message);
+    }
+  });
+});
+
+/* ============================================================
+ *  🔹 5. SERVER
  * ============================================================ */
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log('🧪 Google Drive test runs every 10 seconds');
-});
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
