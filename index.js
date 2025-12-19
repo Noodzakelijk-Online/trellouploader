@@ -3,13 +3,8 @@ import express from 'express';
 import fs from 'fs';
 import path from 'path';
 import { google } from 'googleapis';
-import cookieParser from 'cookie-parser';
 
 const app = express();
-
-// Middleware
-app.use(express.json());
-app.use(cookieParser());
 
 /* ============================================================
  *  GOOGLE DRIVE AUTH
@@ -39,45 +34,24 @@ async function getDriveAuth() {
 }
 
 /* ============================================================
- *  AUTH (BASİT)
+ *  DRIVE TEST JOB
  * ============================================================ */
-const APP_PASSWORD = process.env.APP_PASSWORD || '1234';
+async function runDriveTest() {
+  const now = new Date().toISOString();
+  const fileName = `drive_test_${Date.now()}.csv`;
+  const filePath = path.join(process.cwd(), fileName);
 
-app.post('/api/login', (req, res) => {
-  if (req.body.password === APP_PASSWORD) {
-    res.cookie('auth', 'ok', { httpOnly: true, sameSite: 'lax', secure: true });
-    return res.send('OK');
-  }
-  res.status(401).send('Unauthorized');
-});
-
-function requireAuth(req, res, next) {
-  if (req.cookies?.auth === 'ok') return next();
-  res.status(401).send('Unauthorized');
-}
-
-/* ============================================================
- *  DRIVE TEST ENDPOINT (BUTON TIKLAYINCA)
- * ============================================================ */
-app.get('/api/backup-test', requireAuth, async (req, res) => {
-  try {
-    console.log('🟡 DRIVE TEST STARTED (manual click)');
-
-    const now = new Date().toISOString();
-    const fileName = `drive_test_${Date.now()}.csv`;
-    const filePath = path.join(process.cwd(), fileName);
-
-    // Basit CSV
-    const csvContent = `status,time
+  const csvContent = `status,time
 test,${now}
 `;
 
+  try {
     fs.writeFileSync(filePath, csvContent);
 
     const auth = await getDriveAuth();
     const drive = google.drive({ version: 'v3', auth });
 
-    const upload = await drive.files.create({
+    const res = await drive.files.create({
       requestBody: {
         name: fileName,
         mimeType: 'text/csv',
@@ -91,29 +65,27 @@ test,${now}
 
     fs.unlinkSync(filePath);
 
-    const url = `https://drive.google.com/file/d/${upload.data.id}`;
-
-    console.log('✅ DRIVE TEST SUCCESS:', url);
-
-    res.json({
-      success: true,
-      message: 'Drive test upload successful',
-      driveUrl: url
-    });
+    console.log('✅ DRIVE TEST OK');
+    console.log(`☁️ ${new Date().toLocaleTimeString()} → https://drive.google.com/file/d/${res.data.id}`);
 
   } catch (err) {
     console.error('❌ DRIVE TEST FAILED:', err.message);
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
   }
-});
+}
 
 /* ============================================================
- *  SERVER
+ *  INTERVAL (HER 10 SANİYE)
+ * ============================================================ */
+setInterval(() => {
+  console.log('🟡 Running Drive test...');
+  runDriveTest();
+}, 10000);
+
+/* ============================================================
+ *  SERVER (SADECE RENDER MUTLU OLSUN DİYE)
  * ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
+  console.log('⏱ Drive test will run every 10 seconds');
 });
