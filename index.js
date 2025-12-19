@@ -252,7 +252,7 @@ async function saveToCSVAndUpload(trelloData) {
 }
 
 /* ============================================================
- *  🔹 4. AUTH + ENDPOINTS
+ *  🔹 4. AUTH + ENDPOINTS (BACKGROUND JOB)
  * ============================================================ */
 const APP_PASSWORD = process.env.APP_PASSWORD || '1234';
 
@@ -269,14 +269,22 @@ function requireAuth(req, res, next) {
   res.status(401).send('Unauthorized');
 }
 
-app.get('/api/backup', requireAuth, async (req, res) => {
-  try {
-    const data = await fetchTrelloData();
-    const driveUrl = await saveToCSVAndUpload(data);
-    res.json({ success: true, driveUrl });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
+// ✅ BURASI DEĞİŞTİ — BACKGROUND JOB
+app.get('/api/backup', requireAuth, (req, res) => {
+  // HTTP isteğini hemen kapat
+  res.json({ started: true, message: 'Backup started in background' });
+
+  // Uzun işi arkada çalıştır
+  setImmediate(async () => {
+    try {
+      console.log('🟡 Backup started (background)');
+      const data = await fetchTrelloData();
+      const driveUrl = await saveToCSVAndUpload(data);
+      console.log('✅ Backup finished:', driveUrl);
+    } catch (err) {
+      console.error('❌ Backup failed:', err.message);
+    }
+  });
 });
 
 /* ============================================================
